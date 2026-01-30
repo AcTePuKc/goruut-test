@@ -11,11 +11,13 @@ $ErrorActionPreference = "Stop"
 
 "epoch,metric,value,language" | Set-Content -Path $Out
 
+$epoch = 0
 Get-Content $Log | ForEach-Object {
   if ($_ -match '^\[success rate\] (\d+) % with (\d+) errors (\d+) successes for (.+)$') {
+    $epoch++
     $value = $Matches[1]
     $lang = $Matches[4]
-    "NA,success_rate,$value,$lang" | Add-Content -Path $Out
+    "$epoch,success_rate,$value,$lang" | Add-Content -Path $Out
   }
 }
 
