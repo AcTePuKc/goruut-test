@@ -6,8 +6,15 @@ import "github.com/neurlang/classifier/parallel"
 import "bufio"
 import "strings"
 import "math/rand"
+import "github.com/neurlang/goruut/pkg/gistselect"
 
-func load(filename string, top int) [][2]string {
+type gistFilterConfig struct {
+	enabled bool
+	selectK int
+	lambda  float64
+}
+
+func load(filename string, top int, gistFilter gistFilterConfig) [][2]string {
 	// Open the file
 	file, err := os.Open(filename)
 	if err != nil {
@@ -16,7 +23,7 @@ func load(filename string, top int) [][2]string {
 	}
 	defer file.Close()
 
-	var slice [][2]string
+	entries := make([]gistselect.Entry, 0, 256)
 
 	// Create a new scanner to read the file line by line
 	scanner := bufio.NewScanner(file)
@@ -31,15 +38,38 @@ func load(filename string, top int) [][2]string {
 		}
 
 		// Process each column
-		column1 := columns[0]
-		column2 := columns[1]
-
-		slice = append(slice, [2]string{column1, column2})
+		entry := gistselect.Entry{
+			Word: columns[0],
+			IPA:  columns[1],
+		}
+		if len(columns) == 3 {
+			entry.Extra = columns[2]
+		}
+		entries = append(entries, entry)
 	}
 
 	// Check for any scanner errors
 	if err := scanner.Err(); err != nil {
 		fmt.Println("Error reading file:", err)
+	}
+	if gistFilter.enabled {
+		selectK := gistFilter.selectK
+		if selectK < 0 {
+			selectK = 0
+		}
+		cfg := gistselect.Config{
+			K:        selectK,
+			Lambda:   gistFilter.lambda,
+			Distance: gistselect.JointLevenshtein,
+			Utility:  gistselect.CoverageUtility{},
+		}
+		result := gistselect.Select(entries, cfg)
+		entries = result.Entries
+	}
+
+	slice := make([][2]string, 0, len(entries))
+	for _, entry := range entries {
+		slice = append(slice, [2]string{entry.Word, entry.IPA})
 	}
 	if top >= 0 {
 		rand.Shuffle(len(slice), func(i, j int) { slice[i], slice[j] = slice[j], slice[i] })

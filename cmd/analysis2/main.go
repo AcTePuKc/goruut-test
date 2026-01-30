@@ -87,6 +87,9 @@ func main() {
 	srcsurround := flag.Bool("srcsurround", false, "src surround with _")
 	matrices := flag.Bool("matrices", false, "print matrices")
 	forcedecision := flag.Int("forcedecision", 0, "forcedecision till this row loss is reached")
+	gistEnable := flag.Bool("gist_enable", false, "enable gistselect pre-filtering for input TSV")
+	gistSelectK := flag.Int("gist_select_k", 0, "gistselect top-k entries (0 = keep all)")
+	gistLambda := flag.Float64("gist_lambda", 1.0, "gistselect lambda weight for minimum distance")
 	flag.Parse()
 
 	_ = dstFile
@@ -134,7 +137,11 @@ func main() {
 	var bestLoss uint64
 	var now_hyper int = *hyperinit
 
-	slice := load(*srcFile, 999999999)
+	slice := load(*srcFile, 999999999, gistFilterConfig{
+		enabled: *gistEnable,
+		selectK: *gistSelectK,
+		lambda:  *gistLambda,
+	})
 
 	if len(lang.Map) <= 1 {
 		lang.Init()
