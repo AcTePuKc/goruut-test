@@ -1,595 +1,430 @@
-diff --git a/pkg/gistselect/coverage.go b/pkg/gistselect/coverage.go
+diff --git a/cmd/gistselect/main.go b/cmd/gistselect/main.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..087651a6d1d21179b75fe7a320e892d008b15147
+index 0000000000000000000000000000000000000000..4bf4c4c7db377436bbd1e4faa5df8e2523418d7d
 --- /dev/null
-+++ b/pkg/gistselect/coverage.go
-@@ -0,0 +1,72 @@
-+package gistselect
++++ b/cmd/gistselect/main.go
+@@ -0,0 +1,215 @@
++package main
 +
-+// CoverageUtility implements a monotone submodular set coverage objective.
-+// It treats character n-grams from Word and IPA as features and assigns weights
-+// based on Config's feature weight settings.
-+type CoverageUtility struct{}
++import (
++	"bufio"
++	"errors"
++	"flag"
++	"fmt"
++	"io"
++	"os"
++	"strings"
++	"time"
 +
-+func (CoverageUtility) Init(cfg Config, candidates []Candidate) Utility {
-+	state := &coverageState{
-+		covered: make(map[string]struct{}),
++	"github.com/neurlang/goruut/pkg/gistselect"
++)
++
++const defaultEpsilon = 1e-6
++
++func main() {
++	inPath := flag.String("in", "", "input TSV path (word<TAB>ipa[,<TAB>tags]) or '-' for stdin")
++	outPath := flag.String("out", "", "output TSV path or '-' for stdout")
++	k := flag.Int("k", 0, "number of entries to select (default: all)")
++	lambda := flag.Float64("lambda", 1.0, "weight for minimum distance term")
++	epsilon := flag.Float64("epsilon", defaultEpsilon, "tie-breaking epsilon for gains/distances")
++	distance := flag.String("distance", "joint", "distance mode: word-levenshtein, ipa-levenshtein, joint")
++	utility := flag.String("utility", "joint", "utility mode: word-trigram, ipa-ngram, joint")
++	maxCandidates := flag.Int("max_candidates", 0, "limit number of candidates considered (0 = no limit)")
++	seed := flag.Int64("seed", 0, "deterministic tie-break seed (0 = stable input order)")
++	flag.Usage = func() {
++		fmt.Fprintf(flag.CommandLine.Output(), "Usage: gistselect --in INPUT --out OUTPUT [options]\n\nOptions:\n")
++		flag.PrintDefaults()
++		fmt.Fprintf(flag.CommandLine.Output(), "\nExamples:\n")
++		fmt.Fprintf(flag.CommandLine.Output(), "  gistselect --in dicts/en/lexicon.tsv --out dicts/en/lexicon.gist.tsv --k 200 --distance word-levenshtein --utility word-trigram\n")
++		fmt.Fprintf(flag.CommandLine.Output(), "  gistselect --in dicts/en/learn.tsv --out dicts/en/learn.gist.tsv --k 500 --lambda 0.5 --utility joint\n")
 +	}
-+	return state
++	flag.Parse()
++
++	if *inPath == "" || *outPath == "" {
++		exitWithError(errors.New("both --in and --out are required"))
++	}
++
++	readStart := time.Now()
++	entries, err := readTSV(*inPath)
++	if err != nil {
++		exitWithError(err)
++	}
++	if *maxCandidates > 0 && len(entries) > *maxCandidates {
++		entries = entries[:*maxCandidates]
++	}
++	readDuration := time.Since(readStart)
++
++	cfg := gistselect.Config{
++		K:       *k,
++		Lambda:  *lambda,
++		Epsilon: *epsilon,
++		Seed:    *seed,
++	}
++
++	cfg.Distance, err = parseDistance(*distance)
++	if err != nil {
++		exitWithError(err)
++	}
++	if err := applyUtility(&cfg, *utility); err != nil {
++		exitWithError(err)
++	}
++
++	selectStart := time.Now()
++	result := gistselect.Select(entries, cfg)
++	selectDuration := time.Since(selectStart)
++
++	writeStart := time.Now()
++	if err := writeTSV(*outPath, result.Entries); err != nil {
++		exitWithError(err)
++	}
++	writeDuration := time.Since(writeStart)
++
++	totalDuration := readDuration + selectDuration + writeDuration
++	fmt.Fprintf(os.Stderr,
++		"gistselect summary: input=%d output=%d threshold=%.6f min_distance=%.6f utility=%.6f score=%.6f timings(read=%s select=%s write=%s total=%s)\n",
++		len(entries), len(result.Entries), result.Threshold, result.MinDistance, result.Utility, result.Score,
++		readDuration, selectDuration, writeDuration, totalDuration,
++	)
 +}
 +
-+type coverageState struct {
-+	covered map[string]struct{}
-+	value   float64
-+}
-+
-+func (state *coverageState) Gain(candidate Candidate) float64 {
-+	gain := 0.0
-+	for feature, weight := range candidate.features {
-+		if _, ok := state.covered[feature]; !ok {
-+			gain += weight
-+		}
++func readTSV(path string) ([]gistselect.Entry, error) {
++	reader, closeFn, err := openInput(path)
++	if err != nil {
++		return nil, err
 +	}
-+	return gain
-+}
-+
-+func (state *coverageState) Add(candidate Candidate) {
-+	for feature, weight := range candidate.features {
-+		if _, ok := state.covered[feature]; !ok {
-+			state.covered[feature] = struct{}{}
-+			state.value += weight
-+		}
++	if closeFn != nil {
++		defer closeFn()
 +	}
-+}
 +
-+func (state *coverageState) Value() float64 {
-+	return state.value
-+}
-+
-+func extractFeatures(candidate Candidate, cfg Config) map[string]float64 {
-+	features := make(map[string]float64)
-+	addNGrams(features, "w:", candidate.Word, cfg.NGramMin, cfg.NGramMax, cfg.WordFeatureWeight)
-+	addNGrams(features, "i:", candidate.IPA, cfg.NGramMin, cfg.NGramMax, cfg.IPAFeatureWeight)
-+	return features
-+}
-+
-+func addNGrams(features map[string]float64, prefix, text string, minN, maxN int, weight float64) {
-+	runes := []rune(text)
-+	if len(runes) == 0 {
-+		return
-+	}
-+	if minN < 1 {
-+		minN = 1
-+	}
-+	if maxN < minN {
-+		maxN = minN
-+	}
-+	for n := minN; n <= maxN; n++ {
-+		if n > len(runes) {
++	scanner := bufio.NewScanner(reader)
++	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
++	var entries []gistselect.Entry
++	for scanner.Scan() {
++		line := scanner.Text()
++		if strings.TrimSpace(line) == "" {
 +			continue
 +		}
-+		for i := 0; i+n <= len(runes); i++ {
-+			feature := prefix + string(runes[i:i+n])
-+			if _, exists := features[feature]; !exists {
-+				features[feature] = weight
++		columns := strings.Split(line, "\t")
++		if len(columns) < 2 || len(columns) > 3 {
++			return nil, fmt.Errorf("invalid TSV row (expected 2 or 3 columns): %q", line)
++		}
++		entry := gistselect.Entry{
++			Word: columns[0],
++			IPA:  columns[1],
++		}
++		if len(columns) == 3 {
++			entry.Extra = columns[2]
++		}
++		entries = append(entries, entry)
++	}
++	if err := scanner.Err(); err != nil {
++		return nil, fmt.Errorf("read input: %w", err)
++	}
++	return entries, nil
++}
++
++func writeTSV(path string, entries []gistselect.Entry) error {
++	writer, closeFn, err := openOutput(path)
++	if err != nil {
++		return err
++	}
++	if closeFn != nil {
++		defer closeFn()
++	}
++	buffered := bufio.NewWriter(writer)
++	for _, entry := range entries {
++		if entry.Extra != "" {
++			if _, err := fmt.Fprintf(buffered, "%s\t%s\t%s\n", entry.Word, entry.IPA, entry.Extra); err != nil {
++				return fmt.Errorf("write output: %w", err)
 +			}
++			continue
++		}
++		if _, err := fmt.Fprintf(buffered, "%s\t%s\n", entry.Word, entry.IPA); err != nil {
++			return fmt.Errorf("write output: %w", err)
 +		}
 +	}
++	if err := buffered.Flush(); err != nil {
++		return fmt.Errorf("flush output: %w", err)
++	}
++	return nil
 +}
++
++func openInput(path string) (io.Reader, func() error, error) {
++	if path == "-" {
++		return os.Stdin, nil, nil
++	}
++	file, err := os.Open(path)
++	if err != nil {
++		return nil, nil, fmt.Errorf("open input: %w", err)
++	}
++	return file, file.Close, nil
++}
++
++func openOutput(path string) (io.Writer, func() error, error) {
++	if path == "-" {
++		return os.Stdout, nil, nil
++	}
++	file, err := os.Create(path)
++	if err != nil {
++		return nil, nil, fmt.Errorf("open output: %w", err)
++	}
++	return file, file.Close, nil
++}
++
++func parseDistance(mode string) (gistselect.DistanceFunc, error) {
++	switch normalizeMode(mode) {
++	case "word", "wordlevenshtein":
++		return gistselect.WordLevenshtein, nil
++	case "ipa", "ipalevenshtein":
++		return gistselect.IPALevenshtein, nil
++	case "joint":
++		return gistselect.JointLevenshtein, nil
++	default:
++		return nil, fmt.Errorf("unknown distance mode %q", mode)
++	}
++}
++
++func applyUtility(cfg *gistselect.Config, mode string) error {
++	cfg.Utility = gistselect.CoverageUtility{}
++	switch normalizeMode(mode) {
++	case "wordtrigram":
++		cfg.NGramMin = 3
++		cfg.NGramMax = 3
++		cfg.WordFeatureWeight = 1
++		cfg.IPAFeatureWeight = 0
++	case "ipangram":
++		cfg.NGramMin = 2
++		cfg.NGramMax = 3
++		cfg.WordFeatureWeight = 0
++		cfg.IPAFeatureWeight = 1
++	case "joint":
++		cfg.NGramMin = 2
++		cfg.NGramMax = 3
++		cfg.WordFeatureWeight = 1
++		cfg.IPAFeatureWeight = 1
++	default:
++		return fmt.Errorf("unknown utility mode %q", mode)
++	}
++	return nil
++}
++
++func normalizeMode(mode string) string {
++	mode = strings.ToLower(mode)
++	mode = strings.ReplaceAll(mode, "-", "")
++	mode = strings.ReplaceAll(mode, "_", "")
++	return mode
++}
++
++func exitWithError(err error) {
++	fmt.Fprintln(os.Stderr, "gistselect:", err)
++	os.Exit(1)
++}
+diff --git a/pkg/gistselect/coverage.go b/pkg/gistselect/coverage.go
+index 087651a6d1d21179b75fe7a320e892d008b15147..52d162b09fd9a304f53320f02e9ce8083770f08f 100644
+--- a/pkg/gistselect/coverage.go
++++ b/pkg/gistselect/coverage.go
+@@ -26,47 +26,50 @@ func (state *coverageState) Gain(candidate Candidate) float64 {
+ 	}
+ 	return gain
+ }
+ 
+ func (state *coverageState) Add(candidate Candidate) {
+ 	for feature, weight := range candidate.features {
+ 		if _, ok := state.covered[feature]; !ok {
+ 			state.covered[feature] = struct{}{}
+ 			state.value += weight
+ 		}
+ 	}
+ }
+ 
+ func (state *coverageState) Value() float64 {
+ 	return state.value
+ }
+ 
+ func extractFeatures(candidate Candidate, cfg Config) map[string]float64 {
+ 	features := make(map[string]float64)
+ 	addNGrams(features, "w:", candidate.Word, cfg.NGramMin, cfg.NGramMax, cfg.WordFeatureWeight)
+ 	addNGrams(features, "i:", candidate.IPA, cfg.NGramMin, cfg.NGramMax, cfg.IPAFeatureWeight)
+ 	return features
+ }
+ 
+ func addNGrams(features map[string]float64, prefix, text string, minN, maxN int, weight float64) {
++	if weight == 0 {
++		return
++	}
+ 	runes := []rune(text)
+ 	if len(runes) == 0 {
+ 		return
+ 	}
+ 	if minN < 1 {
+ 		minN = 1
+ 	}
+ 	if maxN < minN {
+ 		maxN = minN
+ 	}
+ 	for n := minN; n <= maxN; n++ {
+ 		if n > len(runes) {
+ 			continue
+ 		}
+ 		for i := 0; i+n <= len(runes); i++ {
+ 			feature := prefix + string(runes[i:i+n])
+ 			if _, exists := features[feature]; !exists {
+ 				features[feature] = weight
+ 			}
+ 		}
+ 	}
+ }
 diff --git a/pkg/gistselect/distance.go b/pkg/gistselect/distance.go
-new file mode 100644
-index 0000000000000000000000000000000000000000..fd391642b6e5c0602e800d9630dda034375791c2
---- /dev/null
+index fd391642b6e5c0602e800d9630dda034375791c2..c3c8b07d17f13240f6b74c1e28df28f868c62115 100644
+--- a/pkg/gistselect/distance.go
 +++ b/pkg/gistselect/distance.go
-@@ -0,0 +1,70 @@
-+package gistselect
-+
-+import "math"
-+
-+// DefaultDistance uses normalized Levenshtein distance on "Word|IPA" strings.
-+func DefaultDistance(a, b Entry) float64 {
-+	left := a.Word + "|" + a.IPA
-+	right := b.Word + "|" + b.IPA
-+	if left == right {
-+		return 0
-+	}
-+	maxLen := max(len([]rune(left)), len([]rune(right)))
-+	if maxLen == 0 {
-+		return 0
-+	}
-+	distance := levenshtein([]rune(left), []rune(right))
-+	return float64(distance) / float64(maxLen)
+@@ -1,33 +1,50 @@
+ package gistselect
+ 
+ import "math"
+ 
+ // DefaultDistance uses normalized Levenshtein distance on "Word|IPA" strings.
+ func DefaultDistance(a, b Entry) float64 {
+-	left := a.Word + "|" + a.IPA
+-	right := b.Word + "|" + b.IPA
++	return normalizedLevenshtein(a.Word+"|"+a.IPA, b.Word+"|"+b.IPA)
 +}
 +
-+func levenshtein(a, b []rune) int {
-+	if len(a) == 0 {
-+		return len(b)
-+	}
-+	if len(b) == 0 {
-+		return len(a)
-+	}
-+	if len(a) < len(b) {
-+		return levenshtein(b, a)
-+	}
-+
-+	previous := make([]int, len(b)+1)
-+	current := make([]int, len(b)+1)
-+	for j := 0; j <= len(b); j++ {
-+		previous[j] = j
-+	}
-+
-+	for i := 1; i <= len(a); i++ {
-+		current[0] = i
-+		for j := 1; j <= len(b); j++ {
-+			cost := 0
-+			if a[i-1] != b[j-1] {
-+				cost = 1
-+			}
-+			current[j] = minInt(
-+				current[j-1]+1,
-+				previous[j]+1,
-+				previous[j-1]+cost,
-+			)
-+		}
-+		copy(previous, current)
-+	}
-+	return previous[len(b)]
++// WordLevenshtein uses normalized Levenshtein distance on words only.
++func WordLevenshtein(a, b Entry) float64 {
++	return normalizedLevenshtein(a.Word, b.Word)
 +}
 +
-+func minInt(values ...int) int {
-+	min := math.MaxInt
-+	for _, v := range values {
-+		if v < min {
-+			min = v
-+		}
-+	}
-+	return min
++// IPALevenshtein uses normalized Levenshtein distance on IPA only.
++func IPALevenshtein(a, b Entry) float64 {
++	return normalizedLevenshtein(a.IPA, b.IPA)
 +}
 +
-+func max(a, b int) int {
-+	if a > b {
-+		return a
-+	}
-+	return b
++// JointLevenshtein uses normalized Levenshtein distance on "Word|IPA" strings.
++func JointLevenshtein(a, b Entry) float64 {
++	return normalizedLevenshtein(a.Word+"|"+a.IPA, b.Word+"|"+b.IPA)
 +}
-diff --git a/pkg/gistselect/doc.go b/pkg/gistselect/doc.go
++
++func normalizedLevenshtein(left, right string) float64 {
+ 	if left == right {
+ 		return 0
+ 	}
+ 	maxLen := max(len([]rune(left)), len([]rune(right)))
+ 	if maxLen == 0 {
+ 		return 0
+ 	}
+ 	distance := levenshtein([]rune(left), []rune(right))
+ 	return float64(distance) / float64(maxLen)
+ }
+ 
+ func levenshtein(a, b []rune) int {
+ 	if len(a) == 0 {
+ 		return len(b)
+ 	}
+ 	if len(b) == 0 {
+ 		return len(a)
+ 	}
+ 	if len(a) < len(b) {
+ 		return levenshtein(b, a)
+ 	}
+ 
+ 	previous := make([]int, len(b)+1)
+ 	current := make([]int, len(b)+1)
+ 	for j := 0; j <= len(b); j++ {
+diff --git a/pkg/gistselect/distance_test.go b/pkg/gistselect/distance_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..cab53e5294ee8f7d9aed4388f08e807e2b0e59eb
+index 0000000000000000000000000000000000000000..fea57ce776663187e7a080c219591563e8243531
 --- /dev/null
-+++ b/pkg/gistselect/doc.go
-@@ -0,0 +1,20 @@
-+// Package gistselect implements a deterministic, standard-library-only
-+// GIST-style selector for compact, diverse lexicons.
-+//
-+// The selector maximizes f(S)=g(S)+λ*minDist(S) where g(S) is a monotone
-+// submodular coverage utility and minDist(S) is the minimum pairwise distance
-+// among selected entries. It sweeps over candidate distance thresholds and, for
-+// each threshold, builds a greedy independent set that maximizes marginal gain
-+// subject to minDist >= threshold. The best-scoring set is returned.
-+//
-+// Complexity:
-+//   - Threshold discovery: O(p) distance evaluations where p is capped by
-+//     Config.MaxThresholdPairs (default 10k).
-+//   - Each threshold sweep: O(k*n) marginal gain evaluations plus O(k*n)
-+//     distance checks for the independence constraint.
-+//
-+// Determinism:
-+//   - Input order is preserved via stable tie-breaking by index.
-+//   - If Config.Seed != 0, deterministic pseudo-random tie-breaking is used for
-+//     equal marginal gains.
-+package gistselect
-diff --git a/pkg/gistselect/gistselect_test.go b/pkg/gistselect/gistselect_test.go
-new file mode 100644
-index 0000000000000000000000000000000000000000..408d773e8e523266d5df02ce584bd67ea6b1e57a
---- /dev/null
-+++ b/pkg/gistselect/gistselect_test.go
-@@ -0,0 +1,107 @@
++++ b/pkg/gistselect/distance_test.go
+@@ -0,0 +1,23 @@
 +package gistselect
 +
 +import "testing"
 +
-+type countUtility struct{}
++func TestDistanceModes(t *testing.T) {
++	a := Entry{Word: "cat", IPA: "kæt"}
++	b := Entry{Word: "bat", IPA: "kæt"}
 +
-+type countState struct {
-+	value float64
-+}
-+
-+func (countUtility) Init(cfg Config, candidates []Candidate) Utility {
-+	return &countState{}
-+}
-+
-+func (state *countState) Gain(candidate Candidate) float64 {
-+	return 1
-+}
-+
-+func (state *countState) Add(candidate Candidate) {
-+	state.value += 1
-+}
-+
-+func (state *countState) Value() float64 {
-+	return state.value
-+}
-+
-+func TestSelectCoverageUtility(t *testing.T) {
-+	entries := []Entry{
-+		{Word: "ab", IPA: ""},
-+		{Word: "bc", IPA: ""},
-+	}
-+	cfg := Config{
-+		K:          2,
-+		Thresholds: []float64{0},
-+		NGramMin:   1,
-+		NGramMax:   1,
-+		Lambda:     0,
-+	}
-+	result := Select(entries, cfg)
-+	if len(result.Entries) != 2 {
-+		t.Fatalf("expected 2 entries selected, got %d", len(result.Entries))
-+	}
-+	if result.Utility != 3 {
-+		t.Fatalf("expected utility 3, got %.2f", result.Utility)
-+	}
-+}
-+
-+func TestSelectDeterministicOrdering(t *testing.T) {
-+	entries := []Entry{
-+		{Word: "aa", IPA: "", Extra: "first"},
-+		{Word: "aa", IPA: "", Extra: "second"},
-+	}
-+	cfg := Config{
-+		K:          1,
-+		Thresholds: []float64{0},
-+		NGramMin:   1,
-+		NGramMax:   1,
-+		Lambda:     0,
-+	}
-+	result := Select(entries, cfg)
-+	if result.Entries[0].Extra != "first" {
-+		t.Fatalf("expected stable tie-break to select first entry")
++	word := WordLevenshtein(a, b)
++	if word <= 0 {
++		t.Fatalf("expected word distance to be positive, got %.3f", word)
 +	}
 +
-+	cfg.Seed = 42
-+	first := Select(entries, cfg)
-+	second := Select(entries, cfg)
-+	if len(first.Entries) != len(second.Entries) || first.Entries[0] != second.Entries[0] {
-+		t.Fatalf("expected deterministic selection with seed")
++	ipa := IPALevenshtein(a, b)
++	if ipa != 0 {
++		t.Fatalf("expected IPA distance 0, got %.3f", ipa)
 +	}
-+}
 +
-+func TestThresholdConstraint(t *testing.T) {
-+	entries := []Entry{
-+		{Word: "a"},
-+		{Word: "b"},
-+		{Word: "c"},
-+	}
-+	distance := func(a, b Entry) float64 {
-+		if a.Word == b.Word {
-+			return 0
-+		}
-+		pair := a.Word + b.Word
-+		switch pair {
-+		case "ab", "ba":
-+			return 0.2
-+		case "ac", "ca", "bc", "cb":
-+			return 0.9
-+		default:
-+			return 1
-+		}
-+	}
-+	cfg := Config{
-+		K:          2,
-+		Thresholds: []float64{0.5},
-+		Lambda:     0,
-+		Distance:   distance,
-+		Utility:    countUtility{},
-+	}
-+	result := Select(entries, cfg)
-+	if len(result.Entries) != 2 {
-+		t.Fatalf("expected 2 entries, got %d", len(result.Entries))
-+	}
-+	if result.Entries[0].Word != "a" || result.Entries[1].Word != "c" {
-+		t.Fatalf("expected entries [a c], got [%s %s]", result.Entries[0].Word, result.Entries[1].Word)
++	joint := JointLevenshtein(a, b)
++	if joint <= 0 {
++		t.Fatalf("expected joint distance to be positive, got %.3f", joint)
 +	}
 +}
 diff --git a/pkg/gistselect/select.go b/pkg/gistselect/select.go
-new file mode 100644
-index 0000000000000000000000000000000000000000..90bebd2873dd007f415722a724320bd0f507d7eb
---- /dev/null
+index 90bebd2873dd007f415722a724320bd0f507d7eb..9c8e10827b6cac60e7c4f5d32283bf5807b03d06 100644
+--- a/pkg/gistselect/select.go
 +++ b/pkg/gistselect/select.go
-@@ -0,0 +1,233 @@
-+package gistselect
-+
-+import (
-+	"math"
-+	"math/rand"
-+	"sort"
-+)
-+
-+const (
-+	defaultEpsilon           = 1e-6
-+	defaultMaxThresholdPairs = 10000
-+	defaultNGramMin          = 2
-+	defaultNGramMax          = 3
-+	defaultWordWeight        = 1.0
-+	defaultIPAWeight         = 1.0
-+)
-+
-+// Select runs the GIST algorithm and returns the best-scoring subset.
-+func Select(entries []Entry, cfg Config) Result {
-+	cfg = cfg.withDefaults(len(entries))
-+	if len(entries) == 0 || cfg.K == 0 {
-+		return Result{}
-+	}
-+
-+	candidates := makeCandidates(entries, cfg)
-+	thresholds := cfg.Thresholds
-+	if len(thresholds) == 0 {
-+		thresholds = deriveThresholds(candidates, cfg)
-+	}
-+	if len(thresholds) == 0 {
-+		thresholds = []float64{0}
-+	}
-+
-+	best := Result{Score: math.Inf(-1)}
-+	for _, threshold := range thresholds {
-+		selected, utility := greedyIndependentSet(candidates, cfg, threshold)
-+		minDist := minDistance(selected, cfg.Distance)
-+		score := utility + cfg.Lambda*minDist
-+		if isBetterScore(score, utility, threshold, best) {
-+			best = Result{
-+				Entries:     entriesFromCandidates(selected),
-+				Utility:     utility,
-+				MinDistance: minDist,
-+				Threshold:   threshold,
-+				Score:       score,
-+			}
+@@ -50,55 +50,60 @@ func Select(entries []Entry, cfg Config) Result {
+ 	return best
+ }
+ 
+ func (cfg Config) withDefaults(entryCount int) Config {
+ 	if cfg.K <= 0 {
+ 		cfg.K = entryCount
+ 	}
+ 	if cfg.Distance == nil {
+ 		cfg.Distance = DefaultDistance
+ 	}
+ 	if cfg.Utility == nil {
+ 		cfg.Utility = CoverageUtility{}
+ 	}
+ 	if cfg.Epsilon <= 0 {
+ 		cfg.Epsilon = defaultEpsilon
+ 	}
+ 	if cfg.MaxThresholdPairs <= 0 {
+ 		cfg.MaxThresholdPairs = defaultMaxThresholdPairs
+ 	}
+ 	if cfg.NGramMin <= 0 {
+ 		cfg.NGramMin = defaultNGramMin
+ 	}
+ 	if cfg.NGramMax < cfg.NGramMin {
+ 		cfg.NGramMax = cfg.NGramMin
+ 	}
+-	if cfg.WordFeatureWeight <= 0 {
++	if cfg.WordFeatureWeight == 0 && cfg.IPAFeatureWeight == 0 {
+ 		cfg.WordFeatureWeight = defaultWordWeight
+-	}
+-	if cfg.IPAFeatureWeight <= 0 {
+ 		cfg.IPAFeatureWeight = defaultIPAWeight
++	} else {
++		if cfg.WordFeatureWeight < 0 {
++			cfg.WordFeatureWeight = defaultWordWeight
 +		}
-+	}
-+
-+	return best
-+}
-+
-+func (cfg Config) withDefaults(entryCount int) Config {
-+	if cfg.K <= 0 {
-+		cfg.K = entryCount
-+	}
-+	if cfg.Distance == nil {
-+		cfg.Distance = DefaultDistance
-+	}
-+	if cfg.Utility == nil {
-+		cfg.Utility = CoverageUtility{}
-+	}
-+	if cfg.Epsilon <= 0 {
-+		cfg.Epsilon = defaultEpsilon
-+	}
-+	if cfg.MaxThresholdPairs <= 0 {
-+		cfg.MaxThresholdPairs = defaultMaxThresholdPairs
-+	}
-+	if cfg.NGramMin <= 0 {
-+		cfg.NGramMin = defaultNGramMin
-+	}
-+	if cfg.NGramMax < cfg.NGramMin {
-+		cfg.NGramMax = cfg.NGramMin
-+	}
-+	if cfg.WordFeatureWeight <= 0 {
-+		cfg.WordFeatureWeight = defaultWordWeight
-+	}
-+	if cfg.IPAFeatureWeight <= 0 {
-+		cfg.IPAFeatureWeight = defaultIPAWeight
-+	}
-+	return cfg
-+}
-+
-+func makeCandidates(entries []Entry, cfg Config) []Candidate {
-+	candidates := make([]Candidate, len(entries))
-+	rng := rand.New(rand.NewSource(cfg.Seed))
-+	useSeed := cfg.Seed != 0
-+	for i, entry := range entries {
-+		tieBreak := int64(i)
-+		if useSeed {
-+			tieBreak = rng.Int63()
++		if cfg.IPAFeatureWeight < 0 {
++			cfg.IPAFeatureWeight = defaultIPAWeight
 +		}
-+		candidates[i] = Candidate{
-+			Entry:    entry,
-+			Index:    i,
-+			TieBreak: tieBreak,
-+		}
-+	}
-+
-+	if _, ok := cfg.Utility.(CoverageUtility); ok {
-+		for i := range candidates {
-+			candidates[i].features = extractFeatures(candidates[i], cfg)
-+		}
-+	}
-+
-+	return candidates
-+}
-+
-+func deriveThresholds(candidates []Candidate, cfg Config) []float64 {
-+	if len(candidates) < 2 {
-+		return []float64{0}
-+	}
-+	maxPairs := cfg.MaxThresholdPairs
-+	distances := make([]float64, 0, maxPairs+1)
-+	distances = append(distances, 0)
-+	pairs := 0
-+	for i := 0; i < len(candidates); i++ {
-+		for j := i + 1; j < len(candidates); j++ {
-+			d := cfg.Distance(candidates[i].Entry, candidates[j].Entry)
-+			distances = append(distances, d)
-+			pairs++
-+			if pairs >= maxPairs {
-+				break
-+			}
-+		}
-+		if pairs >= maxPairs {
-+			break
-+		}
-+	}
-+
-+	sort.Float64s(distances)
-+	unique := make([]float64, 0, len(distances))
-+	for _, d := range distances {
-+		if len(unique) == 0 || math.Abs(d-unique[len(unique)-1]) > cfg.Epsilon {
-+			unique = append(unique, d)
-+		}
-+	}
-+	return unique
-+}
-+
-+func greedyIndependentSet(candidates []Candidate, cfg Config, threshold float64) ([]Candidate, float64) {
-+	utility := cfg.Utility.Init(cfg, candidates)
-+	selected := make([]Candidate, 0, cfg.K)
-+	used := make([]bool, len(candidates))
-+
-+	for len(selected) < cfg.K {
-+		bestIdx := -1
-+		bestGain := 0.0
-+		for i, candidate := range candidates {
-+			if used[i] {
-+				continue
-+			}
-+			if !meetsThreshold(candidate, selected, cfg.Distance, threshold) {
-+				continue
-+			}
-+			gain := utility.Gain(candidate)
-+			if bestIdx == -1 || gain > bestGain+cfg.Epsilon || (math.Abs(gain-bestGain) <= cfg.Epsilon && tieBreak(candidate, candidates[bestIdx])) {
-+				bestIdx = i
-+				bestGain = gain
-+			}
-+		}
-+
-+		if bestIdx == -1 || bestGain <= 0 {
-+			break
-+		}
-+		selected = append(selected, candidates[bestIdx])
-+		used[bestIdx] = true
-+		utility.Add(candidates[bestIdx])
-+	}
-+
-+	return selected, utility.Value()
-+}
-+
-+func meetsThreshold(candidate Candidate, selected []Candidate, distance DistanceFunc, threshold float64) bool {
-+	if threshold <= 0 || len(selected) == 0 {
-+		return true
-+	}
-+	for _, existing := range selected {
-+		if distance(candidate.Entry, existing.Entry) < threshold {
-+			return false
-+		}
-+	}
-+	return true
-+}
-+
-+func minDistance(selected []Candidate, distance DistanceFunc) float64 {
-+	if len(selected) < 2 {
-+		return 0
-+	}
-+	min := math.Inf(1)
-+	for i := 0; i < len(selected); i++ {
-+		for j := i + 1; j < len(selected); j++ {
-+			d := distance(selected[i].Entry, selected[j].Entry)
-+			if d < min {
-+				min = d
-+			}
-+		}
-+	}
-+	if math.IsInf(min, 1) {
-+		return 0
-+	}
-+	return min
-+}
-+
-+func entriesFromCandidates(selected []Candidate) []Entry {
-+	entries := make([]Entry, len(selected))
-+	for i, candidate := range selected {
-+		entries[i] = candidate.Entry
-+	}
-+	return entries
-+}
-+
-+func tieBreak(a, b Candidate) bool {
-+	if a.TieBreak == b.TieBreak {
-+		return a.Index < b.Index
-+	}
-+	return a.TieBreak < b.TieBreak
-+}
-+
-+func isBetterScore(score, utility, threshold float64, best Result) bool {
-+	if score > best.Score+defaultEpsilon {
-+		return true
-+	}
-+	if math.Abs(score-best.Score) <= defaultEpsilon {
-+		if utility > best.Utility+defaultEpsilon {
-+			return true
-+		}
-+		if math.Abs(utility-best.Utility) <= defaultEpsilon {
-+			return threshold < best.Threshold
-+		}
-+	}
-+	return false
-+}
-diff --git a/pkg/gistselect/types.go b/pkg/gistselect/types.go
-new file mode 100644
-index 0000000000000000000000000000000000000000..37d75bedc9035f40da73fd331c32ee71a3c70083
---- /dev/null
-+++ b/pkg/gistselect/types.go
-@@ -0,0 +1,57 @@
-+package gistselect
-+
-+// Entry represents a dictionary row with optional extra metadata.
-+type Entry struct {
-+	Word  string
-+	IPA   string
-+	Extra string
-+}
-+
-+// DistanceFunc computes a distance in [0, +inf) where larger means more diverse.
-+type DistanceFunc func(a, b Entry) float64
-+
-+// UtilityFunc creates a stateful utility tracker for computing marginal gains.
-+// Implementations should be monotone: adding more entries never decreases Value().
-+type UtilityFunc interface {
-+	Init(cfg Config, candidates []Candidate) Utility
-+}
-+
-+// Utility tracks marginal gains for a particular selection.
-+type Utility interface {
-+	Gain(candidate Candidate) float64
-+	Add(candidate Candidate)
-+	Value() float64
-+}
-+
-+// Config controls GIST selection behavior.
-+type Config struct {
-+	K                 int
-+	Lambda            float64
-+	Epsilon           float64
-+	Thresholds        []float64
-+	Seed              int64
-+	Distance          DistanceFunc
-+	Utility           UtilityFunc
-+	MaxThresholdPairs int
-+	NGramMin          int
-+	NGramMax          int
-+	WordFeatureWeight float64
-+	IPAFeatureWeight  float64
-+}
-+
-+// Candidate is an entry with deterministic ordering metadata and cached features.
-+type Candidate struct {
-+	Entry
-+	Index    int
-+	TieBreak int64
-+	features map[string]float64
-+}
-+
-+// Result contains the selected entries and score components.
-+type Result struct {
-+	Entries     []Entry
-+	Utility     float64
-+	MinDistance float64
-+	Threshold   float64
-+	Score       float64
-+}
+ 	}
+ 	return cfg
+ }
+ 
+ func makeCandidates(entries []Entry, cfg Config) []Candidate {
+ 	candidates := make([]Candidate, len(entries))
+ 	rng := rand.New(rand.NewSource(cfg.Seed))
+ 	useSeed := cfg.Seed != 0
+ 	for i, entry := range entries {
+ 		tieBreak := int64(i)
+ 		if useSeed {
+ 			tieBreak = rng.Int63()
+ 		}
+ 		candidates[i] = Candidate{
+ 			Entry:    entry,
+ 			Index:    i,
+ 			TieBreak: tieBreak,
+ 		}
+ 	}
+ 
+ 	if _, ok := cfg.Utility.(CoverageUtility); ok {
+ 		for i := range candidates {
+ 			candidates[i].features = extractFeatures(candidates[i], cfg)
+ 		}
+ 	}

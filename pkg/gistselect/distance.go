@@ -4,8 +4,25 @@ import "math"
 
 // DefaultDistance uses normalized Levenshtein distance on "Word|IPA" strings.
 func DefaultDistance(a, b Entry) float64 {
-	left := a.Word + "|" + a.IPA
-	right := b.Word + "|" + b.IPA
+	return normalizedLevenshtein(a.Word+"|"+a.IPA, b.Word+"|"+b.IPA)
+}
+
+// WordLevenshtein uses normalized Levenshtein distance on words only.
+func WordLevenshtein(a, b Entry) float64 {
+	return normalizedLevenshtein(a.Word, b.Word)
+}
+
+// IPALevenshtein uses normalized Levenshtein distance on IPA only.
+func IPALevenshtein(a, b Entry) float64 {
+	return normalizedLevenshtein(a.IPA, b.IPA)
+}
+
+// JointLevenshtein uses normalized Levenshtein distance on "Word|IPA" strings.
+func JointLevenshtein(a, b Entry) float64 {
+	return normalizedLevenshtein(a.Word+"|"+a.IPA, b.Word+"|"+b.IPA)
+}
+
+func normalizedLevenshtein(left, right string) float64 {
 	if left == right {
 		return 0
 	}

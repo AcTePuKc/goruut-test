@@ -72,11 +72,16 @@ func (cfg Config) withDefaults(entryCount int) Config {
 	if cfg.NGramMax < cfg.NGramMin {
 		cfg.NGramMax = cfg.NGramMin
 	}
-	if cfg.WordFeatureWeight <= 0 {
+	if cfg.WordFeatureWeight == 0 && cfg.IPAFeatureWeight == 0 {
 		cfg.WordFeatureWeight = defaultWordWeight
-	}
-	if cfg.IPAFeatureWeight <= 0 {
 		cfg.IPAFeatureWeight = defaultIPAWeight
+	} else {
+		if cfg.WordFeatureWeight < 0 {
+			cfg.WordFeatureWeight = defaultWordWeight
+		}
+		if cfg.IPAFeatureWeight < 0 {
+			cfg.IPAFeatureWeight = defaultIPAWeight
+		}
 	}
 	return cfg
 }

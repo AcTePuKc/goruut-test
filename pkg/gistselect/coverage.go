@@ -48,6 +48,9 @@ func extractFeatures(candidate Candidate, cfg Config) map[string]float64 {
 }
 
 func addNGrams(features map[string]float64, prefix, text string, minN, maxN int, weight float64) {
+	if weight == 0 {
+		return
+	}
 	runes := []rune(text)
 	if len(runes) == 0 {
 		return
