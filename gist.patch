@@ -1,430 +1,186 @@
-diff --git a/cmd/gistselect/main.go b/cmd/gistselect/main.go
+diff --git a/pkg/gistselect/gistselect_additional_test.go b/pkg/gistselect/gistselect_additional_test.go
 new file mode 100644
-index 0000000000000000000000000000000000000000..4bf4c4c7db377436bbd1e4faa5df8e2523418d7d
+index 0000000000000000000000000000000000000000..a38ec1bfec895384d34477b1330adb7748d4a8d6
 --- /dev/null
-+++ b/cmd/gistselect/main.go
-@@ -0,0 +1,215 @@
-+package main
++++ b/pkg/gistselect/gistselect_additional_test.go
+@@ -0,0 +1,167 @@
++package gistselect
 +
 +import (
-+	"bufio"
-+	"errors"
-+	"flag"
-+	"fmt"
-+	"io"
++	"encoding/csv"
++	"math"
 +	"os"
-+	"strings"
-+	"time"
-+
-+	"github.com/neurlang/goruut/pkg/gistselect"
++	"path/filepath"
++	"testing"
 +)
 +
-+const defaultEpsilon = 1e-6
++func TestDistanceKnownPairs(t *testing.T) {
++	t.Parallel()
 +
-+func main() {
-+	inPath := flag.String("in", "", "input TSV path (word<TAB>ipa[,<TAB>tags]) or '-' for stdin")
-+	outPath := flag.String("out", "", "output TSV path or '-' for stdout")
-+	k := flag.Int("k", 0, "number of entries to select (default: all)")
-+	lambda := flag.Float64("lambda", 1.0, "weight for minimum distance term")
-+	epsilon := flag.Float64("epsilon", defaultEpsilon, "tie-breaking epsilon for gains/distances")
-+	distance := flag.String("distance", "joint", "distance mode: word-levenshtein, ipa-levenshtein, joint")
-+	utility := flag.String("utility", "joint", "utility mode: word-trigram, ipa-ngram, joint")
-+	maxCandidates := flag.Int("max_candidates", 0, "limit number of candidates considered (0 = no limit)")
-+	seed := flag.Int64("seed", 0, "deterministic tie-break seed (0 = stable input order)")
-+	flag.Usage = func() {
-+		fmt.Fprintf(flag.CommandLine.Output(), "Usage: gistselect --in INPUT --out OUTPUT [options]\n\nOptions:\n")
-+		flag.PrintDefaults()
-+		fmt.Fprintf(flag.CommandLine.Output(), "\nExamples:\n")
-+		fmt.Fprintf(flag.CommandLine.Output(), "  gistselect --in dicts/en/lexicon.tsv --out dicts/en/lexicon.gist.tsv --k 200 --distance word-levenshtein --utility word-trigram\n")
-+		fmt.Fprintf(flag.CommandLine.Output(), "  gistselect --in dicts/en/learn.tsv --out dicts/en/learn.gist.tsv --k 500 --lambda 0.5 --utility joint\n")
-+	}
-+	flag.Parse()
-+
-+	if *inPath == "" || *outPath == "" {
-+		exitWithError(errors.New("both --in and --out are required"))
-+	}
-+
-+	readStart := time.Now()
-+	entries, err := readTSV(*inPath)
-+	if err != nil {
-+		exitWithError(err)
-+	}
-+	if *maxCandidates > 0 && len(entries) > *maxCandidates {
-+		entries = entries[:*maxCandidates]
-+	}
-+	readDuration := time.Since(readStart)
-+
-+	cfg := gistselect.Config{
-+		K:       *k,
-+		Lambda:  *lambda,
-+		Epsilon: *epsilon,
-+		Seed:    *seed,
++	tests := []struct {
++		name     string
++		left     Entry
++		right    Entry
++		expected float64
++	}{
++		{
++			name:     "single_rune_change",
++			left:     Entry{Word: "a"},
++			right:    Entry{Word: "b"},
++			expected: 1,
++		},
++		{
++			name:     "empty_vs_nonempty",
++			left:     Entry{Word: "a"},
++			right:    Entry{Word: ""},
++			expected: 1,
++		},
++		{
++			name:     "kitten_sitting",
++			left:     Entry{Word: "kitten"},
++			right:    Entry{Word: "sitting"},
++			expected: 3.0 / 7.0,
++		},
 +	}
 +
-+	cfg.Distance, err = parseDistance(*distance)
-+	if err != nil {
-+		exitWithError(err)
++	for _, tc := range tests {
++		tc := tc
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			got := WordLevenshtein(tc.left, tc.right)
++			if math.Abs(got-tc.expected) > 1e-9 {
++				t.Fatalf("expected %.9f, got %.9f", tc.expected, got)
++			}
++		})
 +	}
-+	if err := applyUtility(&cfg, *utility); err != nil {
-+		exitWithError(err)
-+	}
-+
-+	selectStart := time.Now()
-+	result := gistselect.Select(entries, cfg)
-+	selectDuration := time.Since(selectStart)
-+
-+	writeStart := time.Now()
-+	if err := writeTSV(*outPath, result.Entries); err != nil {
-+		exitWithError(err)
-+	}
-+	writeDuration := time.Since(writeStart)
-+
-+	totalDuration := readDuration + selectDuration + writeDuration
-+	fmt.Fprintf(os.Stderr,
-+		"gistselect summary: input=%d output=%d threshold=%.6f min_distance=%.6f utility=%.6f score=%.6f timings(read=%s select=%s write=%s total=%s)\n",
-+		len(entries), len(result.Entries), result.Threshold, result.MinDistance, result.Utility, result.Score,
-+		readDuration, selectDuration, writeDuration, totalDuration,
-+	)
 +}
 +
-+func readTSV(path string) ([]gistselect.Entry, error) {
-+	reader, closeFn, err := openInput(path)
-+	if err != nil {
-+		return nil, err
++func TestCoverageUtilityMonotone(t *testing.T) {
++	t.Parallel()
++
++	entries := loadEntriesFromTSV(t, filepath.Join("testdata", "gist_small.tsv"))
++	cfg := Config{
++		NGramMin:          1,
++		NGramMax:          1,
++		WordFeatureWeight: 1,
++		IPAFeatureWeight:  1,
 +	}
-+	if closeFn != nil {
-+		defer closeFn()
++	candidates := makeCandidates(entries, cfg)
++	utility := CoverageUtility{}.Init(cfg, candidates)
++
++	prev := utility.Value()
++	for i, candidate := range candidates[:4] {
++		utility.Add(candidate)
++		current := utility.Value()
++		if current+1e-9 < prev {
++			t.Fatalf("coverage utility decreased at %d: %.4f -> %.4f", i, prev, current)
++		}
++		prev = current
++	}
++}
++
++func TestSelectConstraintsAndLambda(t *testing.T) {
++	t.Parallel()
++
++	entries := []Entry{
++		{Word: "a"},
++		{Word: "b"},
++		{Word: "c"},
++	}
++	distance := func(a, b Entry) float64 {
++		if a.Word == b.Word {
++			return 0
++		}
++		switch a.Word + b.Word {
++		case "ab", "ba":
++			return 0.1
++		default:
++			return 0.9
++		}
 +	}
 +
-+	scanner := bufio.NewScanner(reader)
-+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
-+	var entries []gistselect.Entry
-+	for scanner.Scan() {
-+		line := scanner.Text()
-+		if strings.TrimSpace(line) == "" {
-+			continue
++	cfg := Config{
++		K:          2,
++		Thresholds: []float64{0, 0.8},
++		Distance:   distance,
++		Utility:    countUtility{},
++	}
++
++	zeroLambda := cfg
++	zeroLambda.Lambda = 0
++	zeroResult := Select(entries, zeroLambda)
++	if len(zeroResult.Entries) > cfg.K {
++		t.Fatalf("expected at most %d entries, got %d", cfg.K, len(zeroResult.Entries))
++	}
++	if zeroResult.Entries[0].Word != "a" || zeroResult.Entries[1].Word != "b" {
++		t.Fatalf("expected low-lambda selection [a b], got [%s %s]", zeroResult.Entries[0].Word, zeroResult.Entries[1].Word)
++	}
++
++	highLambda := cfg
++	highLambda.Lambda = 10
++	highResult := Select(entries, highLambda)
++	if len(highResult.Entries) > cfg.K {
++		t.Fatalf("expected at most %d entries, got %d", cfg.K, len(highResult.Entries))
++	}
++	if highResult.Entries[0].Word != "a" || highResult.Entries[1].Word != "c" {
++		t.Fatalf("expected high-lambda selection [a c], got [%s %s]", highResult.Entries[0].Word, highResult.Entries[1].Word)
++	}
++	for i := 0; i < len(highResult.Entries); i++ {
++		for j := i + 1; j < len(highResult.Entries); j++ {
++			if distance(highResult.Entries[i], highResult.Entries[j]) < 0.8 {
++				t.Fatalf("expected threshold respected for %q and %q", highResult.Entries[i].Word, highResult.Entries[j].Word)
++			}
 +		}
-+		columns := strings.Split(line, "\t")
-+		if len(columns) < 2 || len(columns) > 3 {
-+			return nil, fmt.Errorf("invalid TSV row (expected 2 or 3 columns): %q", line)
++	}
++}
++
++func loadEntriesFromTSV(t *testing.T, path string) []Entry {
++	t.Helper()
++
++	file, err := os.Open(path)
++	if err != nil {
++		t.Fatalf("open tsv: %v", err)
++	}
++	defer file.Close()
++
++	reader := csv.NewReader(file)
++	reader.Comma = '\t'
++	reader.FieldsPerRecord = -1
++
++	records, err := reader.ReadAll()
++	if err != nil {
++		t.Fatalf("read tsv: %v", err)
++	}
++
++	entries := make([]Entry, 0, len(records))
++	for i, record := range records {
++		if len(record) < 2 {
++			t.Fatalf("expected at least 2 columns at row %d", i+1)
 +		}
-+		entry := gistselect.Entry{
-+			Word: columns[0],
-+			IPA:  columns[1],
++		entry := Entry{
++			Word: record[0],
++			IPA:  record[1],
 +		}
-+		if len(columns) == 3 {
-+			entry.Extra = columns[2]
++		if len(record) > 2 {
++			entry.Extra = record[2]
 +		}
 +		entries = append(entries, entry)
 +	}
-+	if err := scanner.Err(); err != nil {
-+		return nil, fmt.Errorf("read input: %w", err)
++	if len(entries) == 0 {
++		t.Fatalf("expected entries from %s", path)
 +	}
-+	return entries, nil
++	return entries
 +}
-+
-+func writeTSV(path string, entries []gistselect.Entry) error {
-+	writer, closeFn, err := openOutput(path)
-+	if err != nil {
-+		return err
-+	}
-+	if closeFn != nil {
-+		defer closeFn()
-+	}
-+	buffered := bufio.NewWriter(writer)
-+	for _, entry := range entries {
-+		if entry.Extra != "" {
-+			if _, err := fmt.Fprintf(buffered, "%s\t%s\t%s\n", entry.Word, entry.IPA, entry.Extra); err != nil {
-+				return fmt.Errorf("write output: %w", err)
-+			}
-+			continue
-+		}
-+		if _, err := fmt.Fprintf(buffered, "%s\t%s\n", entry.Word, entry.IPA); err != nil {
-+			return fmt.Errorf("write output: %w", err)
-+		}
-+	}
-+	if err := buffered.Flush(); err != nil {
-+		return fmt.Errorf("flush output: %w", err)
-+	}
-+	return nil
-+}
-+
-+func openInput(path string) (io.Reader, func() error, error) {
-+	if path == "-" {
-+		return os.Stdin, nil, nil
-+	}
-+	file, err := os.Open(path)
-+	if err != nil {
-+		return nil, nil, fmt.Errorf("open input: %w", err)
-+	}
-+	return file, file.Close, nil
-+}
-+
-+func openOutput(path string) (io.Writer, func() error, error) {
-+	if path == "-" {
-+		return os.Stdout, nil, nil
-+	}
-+	file, err := os.Create(path)
-+	if err != nil {
-+		return nil, nil, fmt.Errorf("open output: %w", err)
-+	}
-+	return file, file.Close, nil
-+}
-+
-+func parseDistance(mode string) (gistselect.DistanceFunc, error) {
-+	switch normalizeMode(mode) {
-+	case "word", "wordlevenshtein":
-+		return gistselect.WordLevenshtein, nil
-+	case "ipa", "ipalevenshtein":
-+		return gistselect.IPALevenshtein, nil
-+	case "joint":
-+		return gistselect.JointLevenshtein, nil
-+	default:
-+		return nil, fmt.Errorf("unknown distance mode %q", mode)
-+	}
-+}
-+
-+func applyUtility(cfg *gistselect.Config, mode string) error {
-+	cfg.Utility = gistselect.CoverageUtility{}
-+	switch normalizeMode(mode) {
-+	case "wordtrigram":
-+		cfg.NGramMin = 3
-+		cfg.NGramMax = 3
-+		cfg.WordFeatureWeight = 1
-+		cfg.IPAFeatureWeight = 0
-+	case "ipangram":
-+		cfg.NGramMin = 2
-+		cfg.NGramMax = 3
-+		cfg.WordFeatureWeight = 0
-+		cfg.IPAFeatureWeight = 1
-+	case "joint":
-+		cfg.NGramMin = 2
-+		cfg.NGramMax = 3
-+		cfg.WordFeatureWeight = 1
-+		cfg.IPAFeatureWeight = 1
-+	default:
-+		return fmt.Errorf("unknown utility mode %q", mode)
-+	}
-+	return nil
-+}
-+
-+func normalizeMode(mode string) string {
-+	mode = strings.ToLower(mode)
-+	mode = strings.ReplaceAll(mode, "-", "")
-+	mode = strings.ReplaceAll(mode, "_", "")
-+	return mode
-+}
-+
-+func exitWithError(err error) {
-+	fmt.Fprintln(os.Stderr, "gistselect:", err)
-+	os.Exit(1)
-+}
-diff --git a/pkg/gistselect/coverage.go b/pkg/gistselect/coverage.go
-index 087651a6d1d21179b75fe7a320e892d008b15147..52d162b09fd9a304f53320f02e9ce8083770f08f 100644
---- a/pkg/gistselect/coverage.go
-+++ b/pkg/gistselect/coverage.go
-@@ -26,47 +26,50 @@ func (state *coverageState) Gain(candidate Candidate) float64 {
- 	}
- 	return gain
- }
- 
- func (state *coverageState) Add(candidate Candidate) {
- 	for feature, weight := range candidate.features {
- 		if _, ok := state.covered[feature]; !ok {
- 			state.covered[feature] = struct{}{}
- 			state.value += weight
- 		}
- 	}
- }
- 
- func (state *coverageState) Value() float64 {
- 	return state.value
- }
- 
- func extractFeatures(candidate Candidate, cfg Config) map[string]float64 {
- 	features := make(map[string]float64)
- 	addNGrams(features, "w:", candidate.Word, cfg.NGramMin, cfg.NGramMax, cfg.WordFeatureWeight)
- 	addNGrams(features, "i:", candidate.IPA, cfg.NGramMin, cfg.NGramMax, cfg.IPAFeatureWeight)
- 	return features
- }
- 
- func addNGrams(features map[string]float64, prefix, text string, minN, maxN int, weight float64) {
-+	if weight == 0 {
-+		return
-+	}
- 	runes := []rune(text)
- 	if len(runes) == 0 {
- 		return
- 	}
- 	if minN < 1 {
- 		minN = 1
- 	}
- 	if maxN < minN {
- 		maxN = minN
- 	}
- 	for n := minN; n <= maxN; n++ {
- 		if n > len(runes) {
- 			continue
- 		}
- 		for i := 0; i+n <= len(runes); i++ {
- 			feature := prefix + string(runes[i:i+n])
- 			if _, exists := features[feature]; !exists {
- 				features[feature] = weight
- 			}
- 		}
- 	}
- }
-diff --git a/pkg/gistselect/distance.go b/pkg/gistselect/distance.go
-index fd391642b6e5c0602e800d9630dda034375791c2..c3c8b07d17f13240f6b74c1e28df28f868c62115 100644
---- a/pkg/gistselect/distance.go
-+++ b/pkg/gistselect/distance.go
-@@ -1,33 +1,50 @@
- package gistselect
- 
- import "math"
- 
- // DefaultDistance uses normalized Levenshtein distance on "Word|IPA" strings.
- func DefaultDistance(a, b Entry) float64 {
--	left := a.Word + "|" + a.IPA
--	right := b.Word + "|" + b.IPA
-+	return normalizedLevenshtein(a.Word+"|"+a.IPA, b.Word+"|"+b.IPA)
-+}
-+
-+// WordLevenshtein uses normalized Levenshtein distance on words only.
-+func WordLevenshtein(a, b Entry) float64 {
-+	return normalizedLevenshtein(a.Word, b.Word)
-+}
-+
-+// IPALevenshtein uses normalized Levenshtein distance on IPA only.
-+func IPALevenshtein(a, b Entry) float64 {
-+	return normalizedLevenshtein(a.IPA, b.IPA)
-+}
-+
-+// JointLevenshtein uses normalized Levenshtein distance on "Word|IPA" strings.
-+func JointLevenshtein(a, b Entry) float64 {
-+	return normalizedLevenshtein(a.Word+"|"+a.IPA, b.Word+"|"+b.IPA)
-+}
-+
-+func normalizedLevenshtein(left, right string) float64 {
- 	if left == right {
- 		return 0
- 	}
- 	maxLen := max(len([]rune(left)), len([]rune(right)))
- 	if maxLen == 0 {
- 		return 0
- 	}
- 	distance := levenshtein([]rune(left), []rune(right))
- 	return float64(distance) / float64(maxLen)
- }
- 
- func levenshtein(a, b []rune) int {
- 	if len(a) == 0 {
- 		return len(b)
- 	}
- 	if len(b) == 0 {
- 		return len(a)
- 	}
- 	if len(a) < len(b) {
- 		return levenshtein(b, a)
- 	}
- 
- 	previous := make([]int, len(b)+1)
- 	current := make([]int, len(b)+1)
- 	for j := 0; j <= len(b); j++ {
-diff --git a/pkg/gistselect/distance_test.go b/pkg/gistselect/distance_test.go
+diff --git a/pkg/gistselect/testdata/gist_small.tsv b/pkg/gistselect/testdata/gist_small.tsv
 new file mode 100644
-index 0000000000000000000000000000000000000000..fea57ce776663187e7a080c219591563e8243531
+index 0000000000000000000000000000000000000000..63b096de4aa38c7f76e987228ae75cc04e74b71d
 --- /dev/null
-+++ b/pkg/gistselect/distance_test.go
-@@ -0,0 +1,23 @@
-+package gistselect
-+
-+import "testing"
-+
-+func TestDistanceModes(t *testing.T) {
-+	a := Entry{Word: "cat", IPA: "kæt"}
-+	b := Entry{Word: "bat", IPA: "kæt"}
-+
-+	word := WordLevenshtein(a, b)
-+	if word <= 0 {
-+		t.Fatalf("expected word distance to be positive, got %.3f", word)
-+	}
-+
-+	ipa := IPALevenshtein(a, b)
-+	if ipa != 0 {
-+		t.Fatalf("expected IPA distance 0, got %.3f", ipa)
-+	}
-+
-+	joint := JointLevenshtein(a, b)
-+	if joint <= 0 {
-+		t.Fatalf("expected joint distance to be positive, got %.3f", joint)
-+	}
-+}
-diff --git a/pkg/gistselect/select.go b/pkg/gistselect/select.go
-index 90bebd2873dd007f415722a724320bd0f507d7eb..9c8e10827b6cac60e7c4f5d32283bf5807b03d06 100644
---- a/pkg/gistselect/select.go
-+++ b/pkg/gistselect/select.go
-@@ -50,55 +50,60 @@ func Select(entries []Entry, cfg Config) Result {
- 	return best
- }
- 
- func (cfg Config) withDefaults(entryCount int) Config {
- 	if cfg.K <= 0 {
- 		cfg.K = entryCount
- 	}
- 	if cfg.Distance == nil {
- 		cfg.Distance = DefaultDistance
- 	}
- 	if cfg.Utility == nil {
- 		cfg.Utility = CoverageUtility{}
- 	}
- 	if cfg.Epsilon <= 0 {
- 		cfg.Epsilon = defaultEpsilon
- 	}
- 	if cfg.MaxThresholdPairs <= 0 {
- 		cfg.MaxThresholdPairs = defaultMaxThresholdPairs
- 	}
- 	if cfg.NGramMin <= 0 {
- 		cfg.NGramMin = defaultNGramMin
- 	}
- 	if cfg.NGramMax < cfg.NGramMin {
- 		cfg.NGramMax = cfg.NGramMin
- 	}
--	if cfg.WordFeatureWeight <= 0 {
-+	if cfg.WordFeatureWeight == 0 && cfg.IPAFeatureWeight == 0 {
- 		cfg.WordFeatureWeight = defaultWordWeight
--	}
--	if cfg.IPAFeatureWeight <= 0 {
- 		cfg.IPAFeatureWeight = defaultIPAWeight
-+	} else {
-+		if cfg.WordFeatureWeight < 0 {
-+			cfg.WordFeatureWeight = defaultWordWeight
-+		}
-+		if cfg.IPAFeatureWeight < 0 {
-+			cfg.IPAFeatureWeight = defaultIPAWeight
-+		}
- 	}
- 	return cfg
- }
- 
- func makeCandidates(entries []Entry, cfg Config) []Candidate {
- 	candidates := make([]Candidate, len(entries))
- 	rng := rand.New(rand.NewSource(cfg.Seed))
- 	useSeed := cfg.Seed != 0
- 	for i, entry := range entries {
- 		tieBreak := int64(i)
- 		if useSeed {
- 			tieBreak = rng.Int63()
- 		}
- 		candidates[i] = Candidate{
- 			Entry:    entry,
- 			Index:    i,
- 			TieBreak: tieBreak,
- 		}
- 	}
- 
- 	if _, ok := cfg.Utility.(CoverageUtility); ok {
- 		for i := range candidates {
- 			candidates[i].features = extractFeatures(candidates[i], cfg)
- 		}
- 	}
++++ b/pkg/gistselect/testdata/gist_small.tsv
+@@ -0,0 +1,7 @@
++cat	kæt
++bat	bæt
++cap	kæp
++dog	dɔg
++bog	bɔg
++dig	dɪg
++fog	fɔg

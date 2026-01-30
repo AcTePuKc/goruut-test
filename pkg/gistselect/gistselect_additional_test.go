@@ -1,0 +1,167 @@
+package gistselect
+
+import (
+	"encoding/csv"
+	"math"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestDistanceKnownPairs(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		left     Entry
+		right    Entry
+		expected float64
+	}{
+		{
+			name:     "single_rune_change",
+			left:     Entry{Word: "a"},
+			right:    Entry{Word: "b"},
+			expected: 1,
+		},
+		{
+			name:     "empty_vs_nonempty",
+			left:     Entry{Word: "a"},
+			right:    Entry{Word: ""},
+			expected: 1,
+		},
+		{
+			name:     "kitten_sitting",
+			left:     Entry{Word: "kitten"},
+			right:    Entry{Word: "sitting"},
+			expected: 3.0 / 7.0,
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := WordLevenshtein(tc.left, tc.right)
+			if math.Abs(got-tc.expected) > 1e-9 {
+				t.Fatalf("expected %.9f, got %.9f", tc.expected, got)
+			}
+		})
+	}
+}
+
+func TestCoverageUtilityMonotone(t *testing.T) {
+	t.Parallel()
+
+	entries := loadEntriesFromTSV(t, filepath.Join("testdata", "gist_small.tsv"))
+	cfg := Config{
+		NGramMin:          1,
+		NGramMax:          1,
+		WordFeatureWeight: 1,
+		IPAFeatureWeight:  1,
+	}
+	candidates := makeCandidates(entries, cfg)
+	utility := CoverageUtility{}.Init(cfg, candidates)
+
+	prev := utility.Value()
+	for i, candidate := range candidates[:4] {
+		utility.Add(candidate)
+		current := utility.Value()
+		if current+1e-9 < prev {
+			t.Fatalf("coverage utility decreased at %d: %.4f -> %.4f", i, prev, current)
+		}
+		prev = current
+	}
+}
+
+func TestSelectConstraintsAndLambda(t *testing.T) {
+	t.Parallel()
+
+	entries := []Entry{
+		{Word: "a"},
+		{Word: "b"},
+		{Word: "c"},
+	}
+	distance := func(a, b Entry) float64 {
+		if a.Word == b.Word {
+			return 0
+		}
+		switch a.Word + b.Word {
+		case "ab", "ba":
+			return 0.1
+		default:
+			return 0.9
+		}
+	}
+
+	cfg := Config{
+		K:          2,
+		Thresholds: []float64{0, 0.8},
+		Distance:   distance,
+		Utility:    countUtility{},
+	}
+
+	zeroLambda := cfg
+	zeroLambda.Lambda = 0
+	zeroResult := Select(entries, zeroLambda)
+	if len(zeroResult.Entries) > cfg.K {
+		t.Fatalf("expected at most %d entries, got %d", cfg.K, len(zeroResult.Entries))
+	}
+	if zeroResult.Entries[0].Word != "a" || zeroResult.Entries[1].Word != "b" {
+		t.Fatalf("expected low-lambda selection [a b], got [%s %s]", zeroResult.Entries[0].Word, zeroResult.Entries[1].Word)
+	}
+
+	highLambda := cfg
+	highLambda.Lambda = 10
+	highResult := Select(entries, highLambda)
+	if len(highResult.Entries) > cfg.K {
+		t.Fatalf("expected at most %d entries, got %d", cfg.K, len(highResult.Entries))
+	}
+	if highResult.Entries[0].Word != "a" || highResult.Entries[1].Word != "c" {
+		t.Fatalf("expected high-lambda selection [a c], got [%s %s]", highResult.Entries[0].Word, highResult.Entries[1].Word)
+	}
+	for i := 0; i < len(highResult.Entries); i++ {
+		for j := i + 1; j < len(highResult.Entries); j++ {
+			if distance(highResult.Entries[i], highResult.Entries[j]) < 0.8 {
+				t.Fatalf("expected threshold respected for %q and %q", highResult.Entries[i].Word, highResult.Entries[j].Word)
+			}
+		}
+	}
+}
+
+func loadEntriesFromTSV(t *testing.T, path string) []Entry {
+	t.Helper()
+
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open tsv: %v", err)
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	reader.Comma = '\t'
+	reader.FieldsPerRecord = -1
+
+	records, err := reader.ReadAll()
+	if err != nil {
+		t.Fatalf("read tsv: %v", err)
+	}
+
+	entries := make([]Entry, 0, len(records))
+	for i, record := range records {
+		if len(record) < 2 {
+			t.Fatalf("expected at least 2 columns at row %d", i+1)
+		}
+		entry := Entry{
+			Word: record[0],
+			IPA:  record[1],
+		}
+		if len(record) > 2 {
+			entry.Extra = record[2]
+		}
+		entries = append(entries, entry)
+	}
+	if len(entries) == 0 {
+		t.Fatalf("expected entries from %s", path)
+	}
+	return entries
+}
